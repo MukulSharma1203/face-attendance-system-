@@ -1,0 +1,11 @@
+flask
+opencv-python
+insightface
+numpy
+scikit-learn
+onnxruntime
+Pillow
+pandas
+streamlit
+# Optional, but used by the desktop app for blink detection when available
+mediapipe
