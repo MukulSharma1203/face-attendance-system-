@@ -11,11 +11,19 @@ import config
 logger = logging.getLogger("embeddings")
 
 
+def _safe_det_size(width: int, height: int) -> Tuple[int, int]:
+    # RetinaFace backbones expect detector sizes aligned to feature-map stride.
+    safe_w = max(320, (int(width) // 32) * 32)
+    safe_h = max(320, (int(height) // 32) * 32)
+    return safe_w, safe_h
+
+
 @lru_cache(maxsize=1)
 def load_model() -> FaceAnalysis:
     app = FaceAnalysis(name="buffalo_l")
-    app.prepare(ctx_id=-1, det_size=(config.FRAME_WIDTH, config.FRAME_HEIGHT))
-    logger.info("InsightFace model loaded on CPU")
+    det_w, det_h = _safe_det_size(config.FRAME_WIDTH, config.FRAME_HEIGHT)
+    app.prepare(ctx_id=-1, det_size=(det_w, det_h))
+    logger.info("InsightFace model loaded on CPU with det_size=(%d, %d)", det_w, det_h)
     return app
 
 
@@ -34,7 +42,11 @@ def align_face(image: np.ndarray, face_object) -> np.ndarray:
 
 def get_embedding(image: np.ndarray) -> Optional[np.ndarray]:
     model = load_model()
-    faces = model.get(image, max_num=config.MAX_FACES_PER_FRAME)
+    try:
+        faces = model.get(image, max_num=config.MAX_FACES_PER_FRAME)
+    except Exception as exc:
+        logger.warning("Embedding extraction failed: %s", exc)
+        return None
     if not faces:
         return None
 
@@ -54,7 +66,11 @@ def get_all_embeddings(image: np.ndarray) -> List[Tuple[Tuple[int, int, int, int
 
 def get_all_face_data(image: np.ndarray) -> List[Dict]:
     model = load_model()
-    faces = model.get(image, max_num=config.MAX_FACES_PER_FRAME)
+    try:
+        faces = model.get(image, max_num=config.MAX_FACES_PER_FRAME)
+    except Exception as exc:
+        logger.warning("Face detection failed: %s", exc)
+        return []
     out: List[Dict] = []
 
     for face in faces:

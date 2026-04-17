@@ -44,6 +44,13 @@ class DesktopAttendanceApp:
 
         self.last_frame = None
         self.frame_count = 0
+        self.latest_processed_frame = None
+        self.processing_lock = threading.Lock()
+        self.processing_busy = False
+
+        self.fps_counter = 0
+        self.fps_value = 0.0
+        self.fps_last_ts = time.time()
 
         self.emb_cache: Dict[int, np.ndarray] = {}
         self.emb_mtime = -1.0
@@ -272,6 +279,7 @@ class DesktopAttendanceApp:
 
     def _open_capture(self, source: int):
         cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, config.TARGET_FPS)
@@ -311,6 +319,11 @@ class DesktopAttendanceApp:
             self.capture = self._open_capture(int(self.current_source))
             self.is_running = bool(self.capture and self.capture.isOpened())
 
+        with self.processing_lock:
+            self.latest_processed_frame = None
+            self.last_frame = None
+            self.processing_busy = False
+
         if self.is_running:
             self._set_status(f"Camera active: {self.current_source}", ok=True)
         else:
@@ -342,6 +355,11 @@ class DesktopAttendanceApp:
             self.capture = test_cap
             self.current_source = new_source
             self.is_running = True
+
+        with self.processing_lock:
+            self.latest_processed_frame = None
+            self.last_frame = None
+            self.processing_busy = False
 
         self._set_status(f"Camera switched to {new_source}", ok=True)
 
@@ -506,7 +524,7 @@ class DesktopAttendanceApp:
     def _process_frame(self, frame):
         faces = embeddings.get_all_face_data(frame)
         self._cleanup_blink_state()
-        frame_ear = self._get_blink_ear_from_mediapipe(frame)
+        frame_ear = None
 
         if not faces:
             cv2.putText(frame, "No Face", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 255), 2)
@@ -521,6 +539,8 @@ class DesktopAttendanceApp:
             name, sim, user_id = self._recognize(emb)
 
             if user_id is not None and sim >= config.IDENTITY_CONFIDENCE_THRESHOLD:
+                if frame_ear is None:
+                    frame_ear = self._get_blink_ear_from_mediapipe(frame)
                 ear = frame_ear
                 if ear is None:
                     ear = self._compute_ear_from_lmk68(lmk68)
@@ -568,6 +588,17 @@ class DesktopAttendanceApp:
 
         return frame
 
+    def _process_frame_async(self, frame):
+        try:
+            processed = self._process_frame(frame)
+            with self.processing_lock:
+                self.latest_processed_frame = processed
+        except Exception as exc:
+            logger.warning("Async frame processing failed: %s", exc)
+        finally:
+            with self.processing_lock:
+                self.processing_busy = False
+
     def video_loop(self):
         ok, frame = self._read_frame()
         if not ok or frame is None:
@@ -576,15 +607,47 @@ class DesktopAttendanceApp:
                 self.start_camera()
             frame = np.zeros((config.FRAME_HEIGHT, config.FRAME_WIDTH, 3), dtype=np.uint8)
             cv2.putText(frame, "Camera not available", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            display_frame = frame
         else:
             self.frame_count += 1
-            if self.frame_count % max(1, config.TK_PROCESS_EVERY_N_FRAMES) == 0:
-                frame = self._process_frame(frame)
-                self.last_frame = frame.copy()
-            elif self.last_frame is not None:
-                frame = self.last_frame.copy()
+            run_processing = self.frame_count % max(1, config.TK_PROCESS_EVERY_N_FRAMES) == 0
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if run_processing:
+                with self.processing_lock:
+                    if not self.processing_busy:
+                        self.processing_busy = True
+                        worker = threading.Thread(
+                            target=self._process_frame_async,
+                            args=(frame.copy(),),
+                            daemon=True,
+                        )
+                        worker.start()
+
+            with self.processing_lock:
+                if self.latest_processed_frame is not None:
+                    display_frame = self.latest_processed_frame.copy()
+                else:
+                    display_frame = frame
+
+        self.fps_counter += 1
+        now = time.time()
+        elapsed = now - self.fps_last_ts
+        if elapsed >= 1.0:
+            self.fps_value = self.fps_counter / elapsed
+            self.fps_counter = 0
+            self.fps_last_ts = now
+
+        cv2.putText(
+            display_frame,
+            f"FPS: {self.fps_value:.1f}",
+            (10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 80),
+            2,
+        )
+
+        rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         img = Image.fromarray(rgb)
         imgtk = ImageTk.PhotoImage(image=img)
 
